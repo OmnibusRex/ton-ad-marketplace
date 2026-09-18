@@ -4,7 +4,10 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "start": "npx ts-node --esm src/index.ts"
+    "start": "tsx src/index.ts",
+    "diagnose": "tsx test-connection.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@ton/core": "^0.63.1",
@@ -20,6 +23,8 @@
     "@types/node": "^22.0.0",
     "@types/pg": "^8.11.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.3.3"
+    "tsx": "^4.20.5",
+    "typescript": "^5.3.3",
+    "vitest": "^3.2.4"
   }
 }
