@@ -18,6 +18,8 @@ async function startProject() {
     await client.connect();
     const store = new PostgresStore(client);
     await store.migrate();
+    // Live start stays on application-level Postgres escrow. TonContractEscrow
+    // is an unwired testnet adapter stub and must not be used here yet.
     const escrow = new PostgresEscrow(client);
     const marketplace = new Marketplace({
       store,

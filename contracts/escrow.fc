@@ -1,0 +1,199 @@
+;; =============================================================================
+;; TON Ad Marketplace — testnet escrow skeleton
+;; =============================================================================
+;;
+;; UNAUDITED. NOT PRODUCTION-SAFE. TESTNET ONLY. DO NOT DEPLOY TO MAINNET.
+;;
+;; This contract is a compilable skeleton for the seller-priced ad loop:
+;;   1. deposit / lock  — advertiser TON is bound to one order_id hash
+;;   2. release         — admin (publish-success signal) pays the seller
+;;   3. refund          — timeout or admin failure path pays the advertiser
+;;
+;; It is designed so a later TypeScript adapter can implement EscrowPort:
+;;   lock               -> op::deposit  (1)
+;;   releaseToSeller    -> op::release  (2)
+;;   refundToAdvertiser -> op::refund   (3)
+;;   get                -> get_deal
+;;
+;; The live bot does NOT broadcast these messages today. Product tests and
+;; `npm start` keep using application-level EscrowPort (in-memory / Postgres).
+;; =============================================================================
+
+#include "imports/stdlib.fc";
+
+const int op::deposit = 1;
+const int op::release = 2;
+const int op::refund = 3;
+
+const int status::locked = 1;
+const int status::released = 2;
+const int status::refunded = 3;
+
+const int err::bad_amount = 400;
+const int err::unauthorized = 401;
+const int err::not_found = 404;
+const int err::already_exists = 409;
+const int err::already_settled = 410;
+const int err::unknown_op = 411;
+
+;; storage:
+;;   admin:MsgAddressInt
+;;   deals:HashMapE 256 ^Deal
+;;
+;; deals key is sha256(orderId) from the TypeScript adapter.
+;;
+;; deal:
+;;   advertiser:MsgAddressInt
+;;   seller:MsgAddressInt
+;;   amount:Coins
+;;   status:uint8
+;;   deadline:uint64   (unix time; refund allowed after this)
+
+(slice, cell) load_data() inline {
+    slice ds = get_data().begin_parse();
+    slice admin = ds~load_msg_addr();
+    cell deals = ds~load_dict();
+    return (admin, deals);
+}
+
+() save_data(slice admin, cell deals) impure inline {
+    set_data(begin_cell()
+        .store_slice(admin)
+        .store_dict(deals)
+        .end_cell());
+}
+
+cell pack_deal(slice advertiser, slice seller, int amount, int status, int deadline) inline {
+    return begin_cell()
+        .store_slice(advertiser)
+        .store_slice(seller)
+        .store_coins(amount)
+        .store_uint(status, 8)
+        .store_uint(deadline, 64)
+        .end_cell();
+}
+
+(slice, slice, int, int, int) unpack_deal(cell packed) inline {
+    slice s = packed.begin_parse();
+    slice advertiser = s~load_msg_addr();
+    slice seller = s~load_msg_addr();
+    int amount = s~load_coins();
+    int status = s~load_uint(8);
+    int deadline = s~load_uint(64);
+    return (advertiser, seller, amount, status, deadline);
+}
+
+() send_tons(slice to, int amount) impure inline {
+    ;; Internal message, bounceable, dummy src, no extra payload.
+    cell msg = begin_cell()
+        .store_uint(0x10, 6)
+        .store_slice(to)
+        .store_coins(amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .end_cell();
+    ;; Mode 1: pay forwarding fees separately from leftover contract balance.
+    send_raw_message(msg, 1);
+}
+
+() handle_deposit(slice advertiser, int msg_value, slice body) impure inline {
+    int query_id = body~load_uint(64);
+    int order_id_hash = body~load_uint(256);
+    slice seller = body~load_msg_addr();
+    int deadline = body~load_uint(64);
+    query_id = query_id; ;; reserved for a later JS wrapper
+
+    throw_unless(err::bad_amount, msg_value > 0);
+
+    (slice admin, cell deals) = load_data();
+    (_, int found) = udict_get_ref?(deals, 256, order_id_hash);
+    throw_unless(err::already_exists, found == 0);
+
+    cell deal = pack_deal(advertiser, seller, msg_value, status::locked, deadline);
+    deals = udict_set_ref(deals, 256, order_id_hash, deal);
+    save_data(admin, deals);
+}
+
+() handle_release(slice sender, slice body) impure inline {
+    int query_id = body~load_uint(64);
+    int order_id_hash = body~load_uint(256);
+    query_id = query_id;
+
+    (slice admin, cell deals) = load_data();
+    throw_unless(err::unauthorized, equal_slices(sender, admin));
+
+    (cell deal_cell, int found) = udict_get_ref?(deals, 256, order_id_hash);
+    throw_unless(err::not_found, found);
+
+    (slice advertiser, slice seller, int amount, int status, int deadline) = unpack_deal(deal_cell);
+    throw_unless(err::already_settled, status == status::locked);
+
+    ;; Publish-success path only: admin is the off-chain publish signal.
+    send_tons(seller, amount);
+    cell next = pack_deal(advertiser, seller, amount, status::released, deadline);
+    deals = udict_set_ref(deals, 256, order_id_hash, next);
+    save_data(admin, deals);
+}
+
+() handle_refund(slice sender, slice body) impure inline {
+    int query_id = body~load_uint(64);
+    int order_id_hash = body~load_uint(256);
+    query_id = query_id;
+
+    (slice admin, cell deals) = load_data();
+    (cell deal_cell, int found) = udict_get_ref?(deals, 256, order_id_hash);
+    throw_unless(err::not_found, found);
+
+    (slice advertiser, slice seller, int amount, int status, int deadline) = unpack_deal(deal_cell);
+    throw_unless(err::already_settled, status == status::locked);
+
+    ;; Admin may refund on publish failure; anyone may refund after deadline.
+    int allowed = equal_slices(sender, admin) | (now() >= deadline);
+    throw_unless(err::unauthorized, allowed);
+
+    send_tons(advertiser, amount);
+    cell next = pack_deal(advertiser, seller, amount, status::refunded, deadline);
+    deals = udict_set_ref(deals, 256, order_id_hash, next);
+    save_data(admin, deals);
+}
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) {
+        ;; Ignore bounced messages. Do not re-settle.
+        return ();
+    }
+    slice sender = cs~load_msg_addr();
+
+    if (in_msg_body.slice_empty?()) {
+        ;; Plain TON (gas reserve / admin funding). No deal change.
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+    if (op == op::deposit) {
+        handle_deposit(sender, msg_value, in_msg_body);
+        return ();
+    }
+    if (op == op::release) {
+        handle_release(sender, in_msg_body);
+        return ();
+    }
+    if (op == op::refund) {
+        handle_refund(sender, in_msg_body);
+        return ();
+    }
+    throw(err::unknown_op);
+}
+
+slice get_admin() method_id {
+    (slice admin, _) = load_data();
+    return admin;
+}
+
+(slice, slice, int, int, int) get_deal(int order_id_hash) method_id {
+    (_, cell deals) = load_data();
+    (cell deal_cell, int found) = udict_get_ref?(deals, 256, order_id_hash);
+    throw_unless(err::not_found, found);
+    return unpack_deal(deal_cell);
+}

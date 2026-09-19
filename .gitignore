@@ -4,4 +4,6 @@ node_modules/
 !.env.example
 dist/
 coverage/
+contracts/build/
+*.boc
 
