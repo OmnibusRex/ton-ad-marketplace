@@ -4,11 +4,10 @@ import type { EscrowReceipt } from "./types.js";
 /**
  * Custody operations for one ad order.
  *
- * The marketplace never talks to TON directly. A future on-chain contract
- * (lock / release / refund) can implement this port without changing the
- * order state machine. The in-process ledger shipped here is application-level
- * escrow, not an audited custody contract, and must not be treated as
- * production-safe on-chain settlement.
+ * The marketplace never talks to TON directly. `contracts/escrow.fc` is an
+ * unaudited testnet skeleton for lock / release / refund. `TonContractEscrow`
+ * implements this port but throws until wired. The in-process ledger shipped
+ * here is application-level escrow, not production-safe on-chain settlement.
  */
 export type LockEscrowInput = {
   orderId: string;

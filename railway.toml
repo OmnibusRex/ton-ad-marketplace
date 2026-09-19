@@ -1,0 +1,11 @@
+# Host scaffolding only. This file does not deploy the bot by itself.
+# Set secrets in the Railway dashboard. Never commit .env or real tokens.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "npm start"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
