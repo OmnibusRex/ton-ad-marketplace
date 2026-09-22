@@ -5,6 +5,8 @@ import { MarketplaceError } from "./domain/errors.js";
 import { Marketplace } from "./domain/marketplace.js";
 import { findPaymentForComment } from "./adapters/toncenter-payments.js";
 import type { PostgresStore } from "./adapters/postgres-store.js";
+import { sanitizeForLog } from "./log.js";
+import { escapeMarkdown, verifyChannelAdmin } from "./telegram/channel-guard.js";
 
 const { Bot, session, InlineKeyboard } = pkg;
 
@@ -18,21 +20,6 @@ export type SessionData = {
 };
 
 type MyContext = Context & SessionFlavor<SessionData>;
-
-type TelegramApi = {
-  getChat(handle: string): Promise<{
-    id: number | string;
-    type: string;
-    title?: string;
-    username?: string;
-  }>;
-  getMe(): Promise<{ id: number }>;
-  getChatMember(
-    handle: string,
-    userId: number,
-  ): Promise<{ status: string }>;
-  getChatMemberCount(handle: string): Promise<number>;
-};
 
 export type BotRuntimeOptions = {
   token: string;
@@ -50,41 +37,13 @@ function errorText(error: unknown): string {
   return "Something went wrong. Please try again.";
 }
 
-async function verifyChannelAdmin(
-  api: TelegramApi,
-  handle: string,
-): Promise<{
-  handle: string;
-  title: string;
-  telegramChatId: string;
-  memberCount: number;
-  botIsAdmin: boolean;
-}> {
-  const chat = await api.getChat(handle);
-  if (chat.type !== "channel" || !("username" in chat) || !chat.username) {
-    throw new MarketplaceError("INVALID_HANDLE", "Only public Telegram channels can be listed.");
-  }
-  const me = await api.getMe();
-  let botIsAdmin = false;
-  try {
-    const member = await api.getChatMember(handle, me.id);
-    botIsAdmin = member.status === "administrator" || member.status === "creator";
-  } catch {
-    botIsAdmin = false;
-  }
-  const memberCount = await api.getChatMemberCount(handle);
-  return {
-    handle: `@${chat.username}`,
-    title: chat.title ?? `@${chat.username}`,
-    telegramChatId: String(chat.id),
-    memberCount,
-    botIsAdmin,
-  };
-}
-
 export function createBot(options: BotRuntimeOptions) {
   const bot = new Bot<MyContext>(options.token);
   bot.use(session({ initial: (): SessionData => ({ step: "IDLE" }) }));
+  bot.catch((err) => {
+    const cause = err instanceof Error && "error" in err ? (err as { error: unknown }).error : err;
+    console.error(`Telegram bot error: ${sanitizeForLog(cause)}`);
+  });
 
   bot.command("start", async (ctx) => {
     if (ctx.from && options.users) {
@@ -111,9 +70,10 @@ export function createBot(options: BotRuntimeOptions) {
         .text("💎 Buy Ad", `buy_${channel.id}`);
 
       await ctx.reply(
-        `📺 **${channel.title}**\n` +
+        `📺 **${escapeMarkdown(channel.title)}**\n` +
           `👥 Verified Members: ${channel.memberCount}\n` +
-          `💰 Price: ${channel.priceTon} TON`,
+          `💰 Price: ${escapeMarkdown(channel.priceTon)} TON\n` +
+          `${escapeMarkdown(channel.handle)}`,
         { reply_markup: keyboard, parse_mode: "Markdown" },
       );
     }
@@ -157,6 +117,10 @@ export function createBot(options: BotRuntimeOptions) {
     await ctx.answerCallbackQuery("Verifying on the blockchain...");
     try {
       const order = await options.marketplace.getOrder(orderId);
+      if (!ctx.from || String(ctx.from.id) !== order.advertiserId) {
+        await ctx.reply("❌ Only the advertiser who created this order can confirm payment.");
+        return;
+      }
       const observed = await findPaymentForComment(
         {
           walletAddress: options.escrowWalletAddress,
@@ -177,6 +141,7 @@ export function createBot(options: BotRuntimeOptions) {
         paymentComment: observed.comment,
         amountTon: observed.amountTon,
         txHash: observed.txHash,
+        advertiserId: String(ctx.from.id),
       });
       ctx.session.activeOrderId = locked.id;
       ctx.session.step = "AWAITING_AD_TEXT";
@@ -201,8 +166,12 @@ export function createBot(options: BotRuntimeOptions) {
   bot.on("message:text", async (ctx) => {
     const step = ctx.session.step;
     if (step === "AWAITING_CHANNEL_NAME") {
+      if (!ctx.from) {
+        await ctx.reply("❌ Open a private chat with the bot to list a channel.");
+        return;
+      }
       try {
-        const verified = await verifyChannelAdmin(ctx.api, ctx.msg.text.trim());
+        const verified = await verifyChannelAdmin(ctx.api, ctx.msg.text.trim(), ctx.from.id);
         if (!verified.botIsAdmin) {
           await ctx.reply("❌ Verification failed. Ensure the bot is an ADMIN in the channel.");
           return;
@@ -215,20 +184,30 @@ export function createBot(options: BotRuntimeOptions) {
         await ctx.reply(
           `✅ Verified: ${verified.title}\n👥 Members: ${verified.memberCount}\n\n📍 Step 2: Set your price in TON:`,
         );
-      } catch {
-        await ctx.reply("❌ Verification failed. Ensure the bot is an ADMIN in the channel.");
+      } catch (error) {
+        await ctx.reply(`❌ ${errorText(error)}`);
       }
       return;
     }
 
     if (step === "AWAITING_PRICE") {
+      if (!ctx.from || !ctx.session.tempChannelName) {
+        ctx.session.step = "IDLE";
+        await ctx.reply("❌ Start again with /register_channel.");
+        return;
+      }
       try {
+        const verified = await verifyChannelAdmin(ctx.api, ctx.session.tempChannelName, ctx.from.id);
+        if (!verified.botIsAdmin) {
+          await ctx.reply("❌ Verification failed. Ensure the bot is an ADMIN in the channel.");
+          return;
+        }
         await options.marketplace.registerChannel({
-          handle: ctx.session.tempChannelName!,
-          title: ctx.session.tempTitle ?? ctx.session.tempChannelName!,
-          ownerId: String(ctx.from!.id),
-          telegramChatId: ctx.session.tempChatId!,
-          memberCount: ctx.session.tempMemberCount!,
+          handle: verified.handle,
+          title: verified.title,
+          ownerId: String(ctx.from.id),
+          telegramChatId: verified.telegramChatId,
+          memberCount: verified.memberCount,
           priceTon: ctx.msg.text.replace(",", ".").trim(),
           botIsAdmin: true,
         });
@@ -253,16 +232,20 @@ export function createBot(options: BotRuntimeOptions) {
           advertiserId: String(ctx.from!.id),
           text: ctx.msg.text,
         });
-        const published = await options.marketplace.publish(orderId, {
-          publish: async (telegramChatId, text) => {
-            try {
-              await ctx.api.sendMessage(telegramChatId, text);
-              return { ok: true };
-            } catch (error) {
-              return { ok: false, error: error instanceof Error ? error.message : String(error) };
-            }
+        const published = await options.marketplace.publish(
+          orderId,
+          {
+            publish: async (telegramChatId, text) => {
+              try {
+                await ctx.api.sendMessage(telegramChatId, text);
+                return { ok: true };
+              } catch (error) {
+                return { ok: false, error: error instanceof Error ? error.message : String(error) };
+              }
+            },
           },
-        });
+          String(ctx.from!.id),
+        );
         if (published.status === "released") {
           ctx.session.step = "IDLE";
           await ctx.reply("🚀 **AD PUBLISHED!** Your campaign is now live on the target channel.");

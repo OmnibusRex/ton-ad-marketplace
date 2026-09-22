@@ -128,6 +128,7 @@ describe("seller-priced ad marketplace", () => {
       paymentComment: order.paymentComment,
       amountTon: "1.5",
       txHash: "tx-abc",
+      advertiserId: "advertiser-9",
     });
 
     expect(locked.status).toBe("escrow_locked");
@@ -153,6 +154,7 @@ describe("seller-priced ad marketplace", () => {
         paymentComment: first.paymentComment,
         amountTon: "1.4",
         txHash: "tx-low",
+        advertiserId: "advertiser-1",
       }),
     ).rejects.toBeInstanceOf(MarketplaceError);
 
@@ -160,6 +162,7 @@ describe("seller-priced ad marketplace", () => {
       paymentComment: first.paymentComment,
       amountTon: "1.5",
       txHash: "tx-ok",
+      advertiserId: "advertiser-1",
     });
 
     await expect(
@@ -167,6 +170,7 @@ describe("seller-priced ad marketplace", () => {
         paymentComment: second.paymentComment,
         amountTon: "1.5",
         txHash: "tx-ok",
+        advertiserId: "advertiser-2",
       }),
     ).rejects.toMatchObject({ code: "PAYMENT_REUSED" });
   });
@@ -182,6 +186,7 @@ describe("seller-priced ad marketplace", () => {
       paymentComment: order.paymentComment,
       amountTon: "1.5",
       txHash: "tx-abc",
+      advertiserId: "advertiser-9",
     });
     await marketplace.submitAdCopy({
       orderId: order.id,
@@ -189,7 +194,7 @@ describe("seller-priced ad marketplace", () => {
       text: "Buy widgets at example.test",
     });
 
-    const published = await marketplace.publish(order.id, successfulPublisher());
+    const published = await marketplace.publish(order.id, successfulPublisher(), "advertiser-9");
 
     expect(published.status).toBe("released");
     expect(escrow.sellerWasPaid(order.id)).toBe(true);
@@ -208,6 +213,7 @@ describe("seller-priced ad marketplace", () => {
       paymentComment: order.paymentComment,
       amountTon: "1.5",
       txHash: "tx-abc",
+      advertiserId: "advertiser-9",
     });
     await marketplace.submitAdCopy({
       orderId: order.id,
@@ -215,7 +221,7 @@ describe("seller-priced ad marketplace", () => {
       text: "Buy widgets at example.test",
     });
 
-    const failed = await marketplace.publish(order.id, failingPublisher());
+    const failed = await marketplace.publish(order.id, failingPublisher(), "advertiser-9");
 
     expect(failed.status).toBe("publish_failed");
     expect(failed.lastError).toContain("removed");
@@ -234,6 +240,7 @@ describe("seller-priced ad marketplace", () => {
       paymentComment: order.paymentComment,
       amountTon: "1.5",
       txHash: "tx-abc",
+      advertiserId: "advertiser-9",
     });
 
     setNow(new Date(START.getTime() + 60_000));
@@ -256,13 +263,14 @@ describe("seller-priced ad marketplace", () => {
       paymentComment: order.paymentComment,
       amountTon: "1.5",
       txHash: "tx-abc",
+      advertiserId: "advertiser-9",
     });
     await marketplace.submitAdCopy({
       orderId: order.id,
       advertiserId: "advertiser-9",
       text: "Buy widgets at example.test",
     });
-    await marketplace.publish(order.id, failingPublisher());
+    await marketplace.publish(order.id, failingPublisher(), "advertiser-9");
 
     const refunded = await marketplace.refundOrder(order.id);
 
@@ -287,8 +295,123 @@ describe("seller-priced ad marketplace", () => {
       }),
     ).rejects.toMatchObject({ code: "NOT_LOCKED" });
 
-    await expect(marketplace.publish(order.id, successfulPublisher())).rejects.toMatchObject({
+    await expect(marketplace.publish(order.id, successfulPublisher(), "advertiser-9")).rejects.toMatchObject({
       code: "NOT_LOCKED",
     });
+  });
+
+  it("lets the same owner update a price and rejects another owner", async () => {
+    const { marketplace } = setup();
+    const first = await listedChannel(marketplace, { handle: "@NewsDesk", priceTon: "1" });
+    expect(first.handle).toBe("@newsdesk");
+
+    const updated = await listedChannel(marketplace, { handle: "@newsdesk", priceTon: "2.5", memberCount: 20 });
+    expect(updated.id).toBe(first.id);
+    expect(updated.priceTon).toBe("2.5");
+    expect(await marketplace.listChannels()).toHaveLength(1);
+
+    await expect(listedChannel(marketplace, { handle: "@newsdesk", ownerId: "owner-2" })).rejects.toMatchObject({
+      code: "CHANNEL_TAKEN",
+    });
+  });
+
+  it("does not let a stranger publish or trigger a timeout refund", async () => {
+    const { marketplace, escrow, setNow } = setup(60_000);
+    const channel = await listedChannel(marketplace);
+    const order = await marketplace.createOrder({
+      channelId: channel.id,
+      advertiserId: "advertiser-9",
+    });
+    await marketplace.matchPayment({
+      paymentComment: order.paymentComment,
+      amountTon: "1.5",
+      txHash: "tx-abc",
+      advertiserId: "advertiser-9",
+    });
+    setNow(new Date(START.getTime() + 60_000));
+
+    await expect(marketplace.publish(order.id, successfulPublisher(), "stranger")).rejects.toMatchObject({
+      code: "UNAUTHORIZED",
+    });
+    expect((await escrow.get(order.id))?.status).toBe("locked");
+
+    const refunded = await marketplace.refundExpiredOrders();
+    expect(refunded).toHaveLength(1);
+    expect(refunded[0].status).toBe("refunded");
+    expect(escrow.sellerWasPaid(order.id)).toBe(false);
+  });
+
+  it("confirms the same transaction twice for the same advertiser without a second lock", async () => {
+    const { marketplace, escrow } = setup();
+    const channel = await listedChannel(marketplace);
+    const order = await marketplace.createOrder({
+      channelId: channel.id,
+      advertiserId: "advertiser-9",
+    });
+    const first = await marketplace.matchPayment({
+      paymentComment: order.paymentComment,
+      amountTon: "2",
+      txHash: "tx-once",
+      advertiserId: "advertiser-9",
+    });
+    const second = await marketplace.matchPayment({
+      paymentComment: order.paymentComment,
+      amountTon: "2",
+      txHash: "tx-once",
+      advertiserId: "advertiser-9",
+    });
+
+    expect(second.id).toBe(first.id);
+    expect(second.status).toBe("escrow_locked");
+    expect((await escrow.get(order.id))?.amountTon).toBe("1.5");
+  });
+
+  it("rejects ad text over the length cap and a missing transaction hash", async () => {
+    const { marketplace } = setup();
+    const channel = await listedChannel(marketplace);
+    const order = await marketplace.createOrder({
+      channelId: channel.id,
+      advertiserId: "advertiser-9",
+    });
+    await expect(
+      marketplace.matchPayment({
+        paymentComment: order.paymentComment,
+        amountTon: "1.5",
+        txHash: "[object Object]",
+        advertiserId: "advertiser-9",
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_PAYMENT" });
+
+    await marketplace.matchPayment({
+      paymentComment: order.paymentComment,
+      amountTon: "1.5",
+      txHash: "tx-text",
+      advertiserId: "advertiser-9",
+    });
+    await expect(
+      marketplace.submitAdCopy({
+        orderId: order.id,
+        advertiserId: "advertiser-9",
+        text: "a".repeat(3501),
+      }),
+    ).rejects.toMatchObject({ code: "AD_TEXT_TOO_LONG" });
+  });
+
+  it("rejects payment confirmation from someone other than the advertiser", async () => {
+    const { marketplace } = setup();
+    const channel = await listedChannel(marketplace);
+    const order = await marketplace.createOrder({
+      channelId: channel.id,
+      advertiserId: "advertiser-9",
+    });
+    await expect(
+      marketplace.matchPayment({
+        paymentComment: order.paymentComment,
+        amountTon: "1.5",
+        txHash: "tx-other",
+        advertiserId: "stranger",
+      }),
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    expect((await marketplace.getOrder(order.id)).status).toBe("awaiting_payment");
   });
 });

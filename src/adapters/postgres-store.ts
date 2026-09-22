@@ -1,9 +1,9 @@
-import pg from "pg";
-import type { OrderPatch, MarketplaceStore } from "../domain/store.js";
+import { orderStatusConflict, MarketplaceError } from "../domain/errors.js";
+import type { ChannelUpdate, MarketplaceStore, OrderPatch, ReadOptions, UpdateOrderOptions } from "../domain/store.js";
 import type { Channel, Order, OrderStatus } from "../domain/types.js";
-import { MarketplaceError } from "../domain/errors.js";
-
-const { Client } = pg;
+import { queryMappingUnique } from "../db/unique-violation.js";
+import type { SqlQueryable, SqlResult } from "../db/sql.js";
+import { applyAdditiveConstraints } from "./postgres-migrate.js";
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS users (
@@ -83,14 +83,19 @@ function mapOrder(row: Record<string, unknown>): Order {
 }
 
 export class PostgresStore implements MarketplaceStore {
-  constructor(private readonly client: InstanceType<typeof Client>) {}
+  constructor(private readonly client: SqlQueryable) {}
+
+  private query(text: string, values?: unknown[]): Promise<SqlResult> {
+    return queryMappingUnique(() => this.client.query(text, values));
+  }
 
   async migrate(): Promise<void> {
-    await this.client.query(SCHEMA_SQL);
+    await this.query(SCHEMA_SQL);
+    await applyAdditiveConstraints(this.client);
   }
 
   async upsertUser(id: string, username: string | undefined): Promise<void> {
-    await this.client.query(
+    await this.query(
       `INSERT INTO users (id, username) VALUES ($1, $2)
        ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username`,
       [id, username ?? null],
@@ -98,7 +103,7 @@ export class PostgresStore implements MarketplaceStore {
   }
 
   async saveChannel(channel: Channel): Promise<Channel> {
-    await this.client.query(
+    await this.query(
       `INSERT INTO channels (id, handle, title, telegram_chat_id, owner_id, member_count, price_ton, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
@@ -115,18 +120,37 @@ export class PostgresStore implements MarketplaceStore {
     return channel;
   }
 
+  async updateChannel(id: string, patch: ChannelUpdate): Promise<Channel> {
+    const res = await this.query(
+      `UPDATE channels
+       SET title = $2, telegram_chat_id = $3, member_count = $4, price_ton = $5
+       WHERE id = $1
+       RETURNING *`,
+      [id, patch.title, patch.telegramChatId, patch.memberCount, patch.priceTon],
+    );
+    if (!res.rows[0]) {
+      throw new MarketplaceError("CHANNEL_NOT_FOUND", "That channel is not listed.");
+    }
+    return mapChannel(res.rows[0]);
+  }
+
   async listChannels(): Promise<Channel[]> {
-    const res = await this.client.query(`SELECT * FROM channels ORDER BY member_count DESC`);
+    const res = await this.query(`SELECT * FROM channels ORDER BY member_count DESC`);
     return res.rows.map(mapChannel);
   }
 
   async getChannel(id: string): Promise<Channel | null> {
-    const res = await this.client.query(`SELECT * FROM channels WHERE id = $1`, [id]);
+    const res = await this.query(`SELECT * FROM channels WHERE id = $1`, [id]);
+    return res.rows[0] ? mapChannel(res.rows[0]) : null;
+  }
+
+  async getChannelByHandle(handle: string): Promise<Channel | null> {
+    const res = await this.query(`SELECT * FROM channels WHERE lower(handle) = lower($1)`, [handle]);
     return res.rows[0] ? mapChannel(res.rows[0]) : null;
   }
 
   async saveOrder(order: Order): Promise<Order> {
-    await this.client.query(
+    await this.query(
       `INSERT INTO orders (
          id, channel_id, telegram_chat_id, seller_id, advertiser_id, amount_ton,
          payment_comment, status, ad_text, payment_tx_hash, last_error,
@@ -152,33 +176,39 @@ export class PostgresStore implements MarketplaceStore {
     return order;
   }
 
-  async getOrder(id: string): Promise<Order | null> {
-    const res = await this.client.query(`SELECT * FROM orders WHERE id = $1`, [id]);
+  async getOrder(id: string, options?: ReadOptions): Promise<Order | null> {
+    const res = await this.query(`SELECT * FROM orders WHERE id = $1${options?.forUpdate ? " FOR UPDATE" : ""}`, [id]);
     return res.rows[0] ? mapOrder(res.rows[0]) : null;
   }
 
-  async getOrderByPaymentComment(comment: string): Promise<Order | null> {
-    const res = await this.client.query(`SELECT * FROM orders WHERE payment_comment = $1`, [comment]);
+  async getOrderByPaymentComment(comment: string, options?: ReadOptions): Promise<Order | null> {
+    const res = await this.query(
+      `SELECT * FROM orders WHERE payment_comment = $1${options?.forUpdate ? " FOR UPDATE" : ""}`,
+      [comment],
+    );
     return res.rows[0] ? mapOrder(res.rows[0]) : null;
   }
 
-  async getOrderByPaymentTxHash(txHash: string): Promise<Order | null> {
-    const res = await this.client.query(`SELECT * FROM orders WHERE payment_tx_hash = $1`, [txHash]);
+  async getOrderByPaymentTxHash(txHash: string, options?: ReadOptions): Promise<Order | null> {
+    const res = await this.query(
+      `SELECT * FROM orders WHERE payment_tx_hash = $1${options?.forUpdate ? " FOR UPDATE" : ""}`,
+      [txHash],
+    );
     return res.rows[0] ? mapOrder(res.rows[0]) : null;
   }
 
   async listOrdersByStatuses(statuses: OrderStatus[]): Promise<Order[]> {
-    const res = await this.client.query(`SELECT * FROM orders WHERE status = ANY($1)`, [statuses]);
+    const res = await this.query(`SELECT * FROM orders WHERE status = ANY($1)`, [statuses]);
     return res.rows.map(mapOrder);
   }
 
-  async updateOrder(id: string, patch: OrderPatch): Promise<Order> {
+  async updateOrder(id: string, patch: OrderPatch, options?: UpdateOrderOptions): Promise<Order> {
     const current = await this.getOrder(id);
     if (!current) {
       throw new MarketplaceError("ORDER_NOT_FOUND", "Order not found.");
     }
     const next: Order = { ...current, ...patch };
-    await this.client.query(
+    const res = await this.query(
       `UPDATE orders SET
          status = $2,
          ad_text = $3,
@@ -186,7 +216,9 @@ export class PostgresStore implements MarketplaceStore {
          last_error = $5,
          publish_deadline = $6,
          settled_at = $7
-       WHERE id = $1`,
+       WHERE id = $1
+         AND ($8::text[] IS NULL OR status = ANY($8::text[]))
+       RETURNING *`,
       [
         id,
         next.status,
@@ -195,9 +227,17 @@ export class PostgresStore implements MarketplaceStore {
         next.lastError,
         next.publishDeadline,
         next.settledAt,
+        options?.expectedStatuses ?? null,
       ],
     );
-    return next;
+    if (res.rows[0]) {
+      return mapOrder(res.rows[0]);
+    }
+    const fresh = await this.getOrder(id);
+    if (!fresh) {
+      throw new MarketplaceError("ORDER_NOT_FOUND", "Order not found.");
+    }
+    throw orderStatusConflict(fresh.status);
   }
 }
 

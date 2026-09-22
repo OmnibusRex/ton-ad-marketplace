@@ -9,3 +9,8 @@ dockerfilePath = "Dockerfile"
 startCommand = "npm start"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
+
+# Do not set healthcheckPath. This process is a long-polling Telegram worker
+# and does not listen on HTTP. Railway marks the deployment successful while
+# the process stays up. The worker prints `health ok` to stdout and exits
+# after repeated database failures so ON_FAILURE can restart it.

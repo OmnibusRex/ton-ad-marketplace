@@ -1,39 +1,62 @@
-import pg from 'pg';
-const { Client } = pg;
-import * as dotenv from 'dotenv';
-import axios from 'axios';
+import axios from "axios";
+import * as dotenv from "dotenv";
+import { DEFAULT_ESCROW_WALLET, DEFAULT_TONCENTER_API_URL } from "./src/config.js";
+import { createPostgresPool } from "./src/db/postgres.js";
+import { retryTransient } from "./src/db/retry.js";
+import { sanitizeForLog } from "./src/log.js";
+import { assertNoSigningSecrets } from "./src/ton/no-secrets.js";
+import { assertTestnetEndpoint } from "./src/ton/network.js";
 
 dotenv.config();
 
-async function runDiagnostic() {
-  console.log("🔍 Starting TrustLayer Diagnostics...\n");
-
-  // 1. Database Test
-  const client = new Client({ connectionString: process.env.DATABASE_URL });
-  try {
-    await client.connect();
-    console.log("✅ [DATABASE]: Connection to Supabase successful!");
-    const res = await client.query('SELECT NOW()');
-    console.log(`📡 [DATABASE]: Server time is ${res.rows[0].now}`);
-    await client.end();
-  } catch (err) {
-    console.error("❌ [DATABASE]: Failed to connect to Supabase. Check your .env file.");
+async function runDiagnostic(): Promise<void> {
+  console.log("TrustLayer diagnostics (no secrets printed)");
+  assertNoSigningSecrets(process.env);
+  const databaseUrl = process.env.DATABASE_URL?.trim();
+  if (!databaseUrl) {
+    console.error("DATABASE_URL is missing. Set it on the host, not in git.");
+    process.exitCode = 1;
+    return;
   }
 
-  // 2. Blockchain API Test
-  const wallet = "UQCbTW0NWPyE28ltt2GvN5nS0XwVYyf4johavHU2fZQqhRfD";
-  const url = `https://testnet.toncenter.com/api/v2/getTransactions?address=${wallet}&limit=1`;
+  const pool = createPostgresPool(databaseUrl);
   try {
-    const response = await axios.get(url);
-    if (response.data.ok) {
-      console.log("✅ [BLOCKCHAIN]: Toncenter API (Testnet) is reachable!");
+    await retryTransient(() => pool.query("SELECT NOW() AS now"), {
+      attempts: 5,
+      baseDelayMs: 500,
+      maxDelayMs: 30_000,
+      label: "diagnose database",
+    });
+    console.log("Database connection succeeded.");
+  } catch (error) {
+    console.error(`Database connection failed: ${sanitizeForLog(error)}`);
+    process.exitCode = 1;
+  } finally {
+    await pool.end().catch(() => undefined);
+  }
+
+  const apiUrl = process.env.TONCENTER_API_URL?.trim() || DEFAULT_TONCENTER_API_URL;
+  try {
+    assertTestnetEndpoint(apiUrl);
+  } catch (error) {
+    console.error(sanitizeForLog(error));
+    process.exitCode = 1;
+    return;
+  }
+  const wallet = process.env.ESCROW_WALLET_ADDRESS?.trim() || DEFAULT_ESCROW_WALLET;
+  const url = `${apiUrl.replace(/\/$/, "")}/getTransactions`;
+  try {
+    const response = await axios.get(url, { params: { address: wallet, limit: 1 }, timeout: 15_000 });
+    if (response.data?.ok) {
+      console.log("Toncenter testnet endpoint is reachable. This check does not spend TON.");
+    } else {
+      console.error("Toncenter responded without ok=true.");
+      process.exitCode = 1;
     }
-  } catch (err) {
-    console.error("❌ [BLOCKCHAIN]: Failed to reach TON API.");
+  } catch (error) {
+    console.error(`Toncenter request failed: ${sanitizeForLog(error)}`);
+    process.exitCode = 1;
   }
-
-  console.log("\n🚀 All systems ready for deployment!");
-  process.exit();
 }
 
-runDiagnostic();
+void runDiagnostic();
