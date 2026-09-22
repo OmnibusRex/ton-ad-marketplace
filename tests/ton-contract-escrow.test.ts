@@ -1,38 +1,81 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { Address } from "@ton/core";
+import { describe, expect, it, vi } from "vitest";
 import { InMemoryEscrow } from "../src/domain/escrow.js";
 import { MarketplaceError } from "../src/domain/errors.js";
 import { Marketplace } from "../src/domain/marketplace.js";
 import { InMemoryStore } from "../src/adapters/memory-store.js";
 import {
+  EscrowNotSignedError,
   hashOrderId,
   TON_ESCROW_OP,
   TON_ESCROW_STATUS,
   TonContractEscrow,
 } from "../src/adapters/ton-contract-escrow.js";
 
+const testnetContract = Address.parse(`0:${"11".repeat(32)}`).toString({ testOnly: true, bounceable: true });
+
 const funcSource = readFileSync(join(process.cwd(), "contracts/escrow.fc"), "utf8");
 
 describe("TonContractEscrow adapter stub", () => {
-  it("implements EscrowPort and throws until a testnet contract is wired", async () => {
+  it("stays unwired until a testnet contract address is configured", async () => {
     const escrow = new TonContractEscrow({
-      contractAddress: "EQB_FAKE_TESTNET_ESCROW_CONTRACT_ONLY",
+      endpoint: "https://testnet.toncenter.com/api/v2/jsonRPC",
+    });
+    await expect(
+      escrow.lock({
+        orderId: "order-1",
+        sellerId: "seller-1",
+        advertiserId: "advertiser-1",
+        amountTon: "1.5",
+        paymentRef: "tx-abc",
+      }),
+    ).rejects.toMatchObject({ code: "ESCROW_NOT_WIRED" });
+  });
+
+  it("fails closed on a configured testnet contract and does not call the network", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network should not be called"));
+    const escrow = new TonContractEscrow({
+      contractAddress: testnetContract,
       endpoint: "https://testnet.toncenter.com/api/v2/jsonRPC",
     });
 
-    const lock = escrow.lock({
-      orderId: "order-1",
-      sellerId: "seller-1",
-      advertiserId: "advertiser-1",
-      amountTon: "1.5",
-      paymentRef: "tx-abc",
-    });
-    await expect(lock).rejects.toBeInstanceOf(MarketplaceError);
-    await expect(lock).rejects.toMatchObject({ code: "ESCROW_NOT_WIRED" });
-    await expect(escrow.releaseToSeller("order-1")).rejects.toMatchObject({ code: "ESCROW_NOT_WIRED" });
-    await expect(escrow.refundToAdvertiser("order-1")).rejects.toMatchObject({ code: "ESCROW_NOT_WIRED" });
-    await expect(escrow.get("order-1")).rejects.toMatchObject({ code: "ESCROW_NOT_WIRED" });
+    const lockError = await escrow
+      .lock({
+        orderId: "order-1",
+        sellerId: "seller-telegram-id",
+        advertiserId: "advertiser-1",
+        amountTon: "1.5",
+        paymentRef: "tx-abc",
+      })
+      .catch((error: unknown) => error);
+    expect(lockError).toBeInstanceOf(EscrowNotSignedError);
+    expect(lockError).toMatchObject({ code: "ESCROW_NOT_SIGNED" });
+    expect((lockError as EscrowNotSignedError).message).not.toContain("te6");
+    expect(Object.keys(lockError as object)).not.toContain("unsignedBoc");
+
+    const releaseError = await escrow.releaseToSeller("order-1").catch((error: unknown) => error);
+    expect(releaseError).toBeInstanceOf(EscrowNotSignedError);
+    const unsignedBoc = (releaseError as EscrowNotSignedError).unsignedBoc;
+    expect(unsignedBoc && unsignedBoc.length).toBeGreaterThan(10);
+    expect((releaseError as EscrowNotSignedError).message).not.toContain(unsignedBoc);
+    expect(JSON.stringify(releaseError)).not.toContain(unsignedBoc);
+
+    await expect(escrow.refundToAdvertiser("order-1")).rejects.toMatchObject({ code: "ESCROW_NOT_SIGNED" });
+    await expect(escrow.get("order-1")).rejects.toMatchObject({ code: "ESCROW_READ_UNAVAILABLE" });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
+  });
+
+  it("rejects a mainnet endpoint before any message is built", () => {
+    expect(
+      () =>
+        new TonContractEscrow({
+          contractAddress: testnetContract,
+          endpoint: "https://toncenter.com/api/v2/jsonRPC",
+        }),
+    ).toThrow(/[Mm]ainnet/);
   });
 
   it("hashes order ids deterministically for the FunC uint256 key", async () => {
@@ -82,17 +125,22 @@ describe("TonContractEscrow adapter stub", () => {
       paymentComment: order.paymentComment,
       amountTon: "1",
       txHash: "tx-loop",
+      advertiserId: "advertiser-9",
     });
     await marketplace.submitAdCopy({
       orderId: order.id,
       advertiserId: "advertiser-9",
       text: "Hello channel",
     });
-    const published = await marketplace.publish(order.id, {
-      async publish() {
-        return { ok: true };
+    const published = await marketplace.publish(
+      order.id,
+      {
+        async publish() {
+          return { ok: true };
+        },
       },
-    });
+      "advertiser-9",
+    );
 
     expect(published.status).toBe("released");
     expect(escrow.sellerWasPaid(order.id)).toBe(true);

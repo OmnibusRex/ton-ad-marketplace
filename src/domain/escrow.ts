@@ -32,6 +32,11 @@ export class InMemoryEscrow implements EscrowPort {
     if (existing) {
       throw new MarketplaceError("ALREADY_LOCKED", `Escrow already exists for order ${input.orderId}`);
     }
+    for (const receipt of this.receipts.values()) {
+      if (receipt.paymentRef === input.paymentRef) {
+        throw new MarketplaceError("PAYMENT_REUSED", "This transaction was already matched to an order.");
+      }
+    }
     const receipt: EscrowReceipt = {
       orderId: input.orderId,
       status: "locked",

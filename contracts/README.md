@@ -15,7 +15,7 @@ The live marketplace still uses application-level `EscrowPort` (`InMemoryEscrow`
 
 Status values: `1` locked, `2` released, `3` refunded.
 
-The TypeScript stub `TonContractEscrow` implements `EscrowPort` and throws `ESCROW_NOT_WIRED` until a later change actually sends these messages. Product tests must keep using in-memory / Postgres escrow.
+`TonContractEscrow` implements `EscrowPort` and does **not** send these messages. Without a contract address it throws `ESCROW_NOT_WIRED`. With `ESCROW_MODE=ton_testnet` it throws `ESCROW_NOT_SIGNED` (and does not call the network). The default `npm start` path keeps using Postgres escrow. Product tests keep using in-memory / Postgres escrow.
 
 ## Message bodies (for a future JS wrapper)
 
@@ -52,14 +52,15 @@ func -o /tmp/escrow.fif -SPA contracts/imports/stdlib.fc contracts/escrow.fc
 
 ## Deploy notes — testnet only
 
-This repository does **not** ship a deploy script that spends TON. A human who later experiments on testnet would, outside this PR:
+`npm run prepare:escrow -- --admin <public-testnet-address>` writes unsigned code, data, and state-init BOCs under `contracts/build/`. It does not spend TON and it will not accept a mnemonic. Full steps: `docs/TESTNET_ESCROW.md`.
 
-1. Create or reuse a **testnet** operator wallet. Never put a mnemonic in git or `.env` committed to the repo.
-2. Compile the contract (`npm run compile:escrow`).
-3. Build init data: admin `MsgAddress` + empty deals dict.
-4. Deploy the code+data cell with a testnet tool (TON CLI, Blueprint, or Tonkeeper testnet) to **testnet**. Confirm the explorer host is testnet (for example `testnet.tonviewer.com`).
-5. Send a small extra testnet TON balance for gas.
-6. Only then could `TonContractEscrow` be wired. Until that happens, `npm start` stays on `PostgresEscrow`.
+A human who later experiments on testnet still has to, outside this repo:
+
+1. Create or reuse a **testnet** operator wallet. Never put a mnemonic in git, Railway, or `.env` committed to the repo.
+2. Review the BOCs (`npm run prepare:escrow` or `npm run compile:escrow`).
+3. Deploy the state init with a testnet tool to **testnet**. Confirm the explorer host is testnet (for example `testnet.tonviewer.com`).
+4. Send a small extra testnet TON balance for gas yourself.
+5. Only on a non-production host, set `ESCROW_MODE=ton_testnet`, `ESCROW_TESTNET_ACK=I_UNDERSTAND_NO_BROADCAST`, and `ESCROW_CONTRACT_ADDRESS`. The process will still refuse to broadcast.
 
 **Do not deploy to mainnet.** There is no mainnet checklist here on purpose.
 

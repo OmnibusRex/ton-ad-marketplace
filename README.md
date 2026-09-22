@@ -8,7 +8,7 @@ This is not a bounty marketplace, not AI matching, not a dispute DAO, and not a 
 
 ## Product loop
 
-1. **List.** The owner sends a public `@handle`. The bot checks it is an admin in that channel, records the live member count, and stores the owner-set price in TON.
+1. **List.** The owner sends a public `@handle`. The bot checks that this user is a channel admin and that the bot can post, records the live member count, and stores the owner-set price in TON.
 2. **Buy.** An advertiser opens `/explore`, picks a channel, and creates an order. Payment is detected by comment (`AdOrder_<orderId>`) and **locked to that order**.
 3. **Publish.** After the lock, the advertiser sends the ad text. The bot posts it to the target channel.
 4. **Settle.** Successful publish **releases** escrow to the channel owner. Failed publish leaves funds locked (owner is not paid). Timeout or an explicit refund **returns** the lock to the advertiser.
@@ -19,7 +19,7 @@ The original prototype watched Toncenter comments into a hot wallet. That is pay
 
 This repo uses an **application-level escrow state machine** (`EscrowPort`: `lock` / `releaseToSeller` / `refundToAdvertiser`). Tests exercise that machine with an in-memory ledger. Live `npm start` uses the same port on Postgres. The bot never broadcasts payouts.
 
-`contracts/escrow.fc` is an **unaudited testnet FunC skeleton** for the same three operations (deposit/lock, release after a publish signal, refund on timeout/failure). `TonContractEscrow` implements `EscrowPort` and throws `ESCROW_NOT_WIRED` until a later change actually sends TON messages. That adapter is **not** used on the live start path. The contract is **not** production-safe and **must not** be deployed to mainnet. See `contracts/README.md`.
+`contracts/escrow.fc` is an **unaudited testnet FunC skeleton** for the same three operations (deposit/lock, release after a publish signal, refund on timeout/failure). `TonContractEscrow` implements `EscrowPort` and **does not broadcast**. It is used only when `ESCROW_MODE=ton_testnet` is set together with an acknowledgement and a contract address; even then every mutator throws `ESCROW_NOT_SIGNED`. The default start path is still `PostgresEscrow`. The contract is **not** production-safe and **must not** be deployed to mainnet. See `contracts/README.md` and `docs/TESTNET_ESCROW.md`.
 
 ## Tests
 
@@ -29,9 +29,9 @@ No Telegram token, database, or TON credentials are required.
 npm test
 ```
 
-That command covers listing, payment match, successful publish (release), failed publish (no release), timeout/refund (owner is not paid), the unwired `TonContractEscrow` stub, and a compile check of the FunC skeleton (no transaction is sent).
+That command covers listing, payment match, successful publish (release), failed publish (no release), timeout/refund (owner is not paid), the non-broadcasting `TonContractEscrow` adapter, and a compile check of the FunC skeleton (no transaction is sent).
 
-CI runs the same command (`.github/workflows/test.yml`).
+CI runs `npm test`, `npm run typecheck`, and `npm run compile:escrow` (`.github/workflows/test.yml`).
 
 ```bash
 npm run compile:escrow
@@ -53,6 +53,12 @@ The Grammy process uses long polling (`bot.start()`). It does not need a public 
 | `TONCENTER_API_URL` | no | `https://testnet.toncenter.com/api/v2` | Toncenter REST base URL (keep testnet) |
 | `TONCENTER_API_KEY` | no | `toncenter-test-key-not-real` | Optional Toncenter API key |
 | `ORDER_TIMEOUT_MS` | no | `3600000` | Locked-order timeout before refund (milliseconds) |
+| `ESCROW_MODE` | no | `postgres` | `postgres` (default) or `ton_testnet`. Mainnet is rejected |
+| `ESCROW_TESTNET_ACK` | only with `ton_testnet` | `I_UNDERSTAND_NO_BROADCAST` | Required acknowledgement. That mode still does not send TON |
+| `ESCROW_CONTRACT_ADDRESS` | only with `ton_testnet` | *(address you deployed)* | Testnet contract address. Leave empty on Railway |
+| `DB_CONNECT_ATTEMPTS` | no | `5` | Bounded Neon connect/migrate retries (max 10) |
+| `HEALTH_INTERVAL_MS` | no | `60000` | Stdout health line interval. Minimum 5000 |
+| `HEALTH_FAILURE_THRESHOLD` | no | `5` | Consecutive failed probes before the process exits |
 
 Scaffolding in this repo (does **not** deploy by itself):
 
@@ -73,7 +79,23 @@ docker run --rm \
   ton-ad-marketplace
 ```
 
-Operator walkthrough for tomorrow (human vs automated steps): [`docs/GO_LIVE.md`](docs/GO_LIVE.md).
+Operator walkthrough (human vs automated steps): [`docs/GO_LIVE.md`](docs/GO_LIVE.md).
+
+Unsigned testnet contract steps: [`docs/TESTNET_ESCROW.md`](docs/TESTNET_ESCROW.md). Residual risks: [`SECURITY.md`](SECURITY.md).
+
+## How Railway knows the worker is healthy
+
+`npm start` is a Grammy long-polling process. It does not open an HTTP port, and `railway.toml` does not set `healthcheckPath`. Railway treats the deployment as up while that process keeps running.
+
+The process prints a stdout line about once a minute:
+
+```text
+health ok db=up escrow=postgres uptime_s=60 failures=0
+```
+
+Startup connects through a small pool (`max` 3) and retries transient Neon errors (`ETIMEDOUT` and friends) with exponential backoff, up to `DB_CONNECT_ATTEMPTS`. Idle client errors are logged and do not crash Node by themselves. If the database probe keeps failing for `HEALTH_FAILURE_THRESHOLD` intervals, the process exits 1. `restartPolicyType = ON_FAILURE` can start it again. Do not point a Railway HTTP healthcheck at this service; nothing is listening, and the deploy would flap.
+
+Leave `ESCROW_MODE` unset on the live service. The boot log should say `PostgresEscrow ledger` and must not say that on-chain payouts are enabled.
 
 ## Run the live bot locally
 

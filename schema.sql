@@ -1,3 +1,8 @@
+-- Base tables. Startup also applies additive constraints in
+-- src/adapters/postgres-migrate.ts (status checks, unique payment_ref,
+-- unique lower(handle), non-negative member_count). A constraint is skipped
+-- with a warning when existing rows would violate it.
+
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   username TEXT

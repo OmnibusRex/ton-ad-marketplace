@@ -73,6 +73,7 @@ export type MatchPaymentInput = {
   paymentComment: string;
   amountTon: string;
   txHash: string;
+  advertiserId: string;
 };
 
 export type SubmitAdInput = {
